@@ -8,6 +8,7 @@
 # DeiT: https://github.com/facebookresearch/deit
 # BEiT: https://github.com/microsoft/unilm/tree/master/beit
 # --------------------------------------------------------
+
 import argparse
 import datetime
 import json
@@ -26,50 +27,29 @@ from iopath.common.file_io import g_pathmgr as pathmgr
 from mae_st import models_mae
 from mae_st.engine_pretrain import train_one_epoch
 from mae_st.util.kinetics import Kinetics
+from mae_st.util.cag import CAGDataset
+from mae_st.util.cag_dataset import CAGDATASET
 from mae_st.util.misc import NativeScalerWithGradNormCount as NativeScaler
 from tensorboard.compat.tensorflow_stub.io.gfile import register_filesystem
 from torch.utils.tensorboard import SummaryWriter
+import yaml
+import sys
+from monai.data import (
+    list_data_collate, pad_list_data_collate,
+    ThreadDataLoader)
+from monai.data import DistributedWeightedRandomSampler, DistributedSampler, Dataset
 
+sys.path.append("/home/alatar/miacag")
+from miacag.dataloader.Classification._3D.dataloader_monai_classification_3D import \
+                    train_monai_classification_loader, val_monai_classification_loader
 
 def get_args_parser():
     parser = argparse.ArgumentParser("MAE pre-training", add_help=False)
-    parser.add_argument(
-        "--batch_size",
-        default=4,
-        type=int,
-        help="Batch size per GPU (effective batch size is batch_size * accum_iter * # gpus",
-    )
-    parser.add_argument("--epochs", default=100, type=int)
-    parser.add_argument(
-        "--accum_iter",
-        default=1,
-        type=int,
-        help="Accumulate gradient iterations (for increasing the effective batch size under memory constraints)",
-    )
 
     # Model parameters
-    parser.add_argument(
-        "--model",
-        default="mae_vit_large_patch16",
-        type=str,
-        metavar="MODEL",
-        help="Name of model to train",
-    )
 
     parser.add_argument("--input_size", default=224, type=int, help="images input size")
 
-    parser.add_argument(
-        "--mask_ratio",
-        default=0.75,
-        type=float,
-        help="Masking ratio (percentage of removed patches).",
-    )
-
-    parser.add_argument(
-        "--norm_pix_loss",
-        action="store_true",
-        help="Use (per-patch) normalized pixels as targets for computing loss",
-    )
     parser.set_defaults(norm_pix_loss=False)
 
     # Optimizer parameters
@@ -85,13 +65,6 @@ def get_args_parser():
         help="learning rate (absolute lr)",
     )
     parser.add_argument(
-        "--blr",
-        type=float,
-        default=1e-3,
-        metavar="LR",
-        help="base learning rate: absolute_lr = base_lr * total_batch_size / 256",
-    )
-    parser.add_argument(
         "--min_lr",
         type=float,
         default=0.0,
@@ -100,23 +73,11 @@ def get_args_parser():
     )
 
     parser.add_argument(
-        "--warmup_epochs", type=int, default=40, metavar="N", help="epochs to warmup LR"
-    )
-    parser.add_argument(
-        "--path_to_data_dir",
+        "--config_path",
         default="",
-        help="path where to save, empty for no saving",
+        help="path to yaml config path",
     )
-    parser.add_argument(
-        "--output_dir",
-        default="./output_dir",
-        help="path where to save, empty for no saving",
-    )
-    parser.add_argument(
-        "--log_dir",
-        default="",
-        help="path where to tensorboard log",
-    )
+        
     parser.add_argument(
         "--device", default="cuda", help="device to use for training / testing"
     )
@@ -127,19 +88,12 @@ def get_args_parser():
         "--start_epoch", default=0, type=int, metavar="N", help="start epoch"
     )
     parser.add_argument("--num_workers", default=10, type=int)
-    parser.add_argument(
-        "--pin_mem",
-        action="store_true",
-        help="Pin CPU memory in DataLoader for more efficient (sometimes) transfer to GPU.",
-    )
     parser.add_argument("--no_pin_mem", action="store_false", dest="pin_mem")
     parser.set_defaults(pin_mem=True)
 
     # distributed training parameters
-    parser.add_argument(
-        "--world_size", default=1, type=int, help="number of distributed processes"
-    )
-    parser.add_argument("--local_rank", default=-1, type=int)
+    parser.add_argument("--local_rank", type=int) #chr edit
+    parser.add_argument("--local-rank", type=int) #chr edit
     parser.add_argument("--dist_on_itp", action="store_true")
     parser.add_argument("--no_env", action="store_true")
 
@@ -148,20 +102,8 @@ def get_args_parser():
         "--dist_url", default="env://", help="url used to set up distributed training"
     )
 
-    parser.add_argument("--decoder_embed_dim", default=512, type=int)
-    parser.add_argument("--decoder_depth", default=8, type=int)
     parser.add_argument("--decoder_num_heads", default=16, type=int)
-    parser.add_argument("--t_patch_size", default=2, type=int)
-    parser.add_argument("--num_frames", default=16, type=int)
     parser.add_argument("--checkpoint_period", default=1, type=int)
-    parser.add_argument("--sampling_rate", default=4, type=int)
-    parser.add_argument("--distributed", action="store_true")
-    parser.add_argument("--repeat_aug", default=4, type=int)
-    parser.add_argument(
-        "--clip_grad",
-        type=float,
-        default=None,
-    )
     parser.add_argument("--no_qkv_bias", action="store_true")
     parser.add_argument("--bias_wd", action="store_true")
     parser.add_argument("--num_checkpoint_del", default=20, type=int)
@@ -194,18 +136,24 @@ def get_args_parser():
         type=float,
         nargs="+",
     )
-    parser.add_argument(
-        "--pred_t_dim",
-        type=int,
-        default=8,
-    )
     parser.add_argument("--cls_embed", action="store_true")
     parser.set_defaults(cls_embed=True)
     return parser
 
-
+def read_yaml(config_path):
+    # read yaml file:
+    with open(config_path, "r") as f:
+        config = yaml.load(f, Loader=yaml.FullLoader)
+    return config
+        
 def main(args):
+    print('starting')
     misc.init_distributed_mode(args)
+    config = read_yaml(args.config_path)
+    config['loaders']['mode'] = 'training'
+    config['cpu'] = "False"
+    config['use_DDP'] = 'True'
+    config['num_workers'] = args.num_workers
 
     print("job dir: {}".format(os.path.dirname(os.path.realpath(__file__))))
     print("{}".format(args).replace(", ", ",\n"))
@@ -219,48 +167,81 @@ def main(args):
 
     cudnn.benchmark = True
 
-    dataset_train = Kinetics(
-        mode="pretrain",
-        path_to_data_dir=args.path_to_data_dir,
-        sampling_rate=args.sampling_rate,
-        num_frames=args.num_frames,
-        train_jitter_scales=(256, 320),
-        repeat_aug=args.repeat_aug,
-        jitter_aspect_relative=args.jitter_aspect_relative,
-        jitter_scales_relative=args.jitter_scales_relative,
-    )
+
+    
+    if config['distributed_dataset_backend'] == 'monai':
+        cag_dataset = CAGDataset(config=config)
+        dataset_train = train_monai_classification_loader(
+            cag_dataset.df_train,
+            config)
+        dataset_train = dataset_train()
+    elif config['distributed_dataset_backend'] == 'pytorch':
+        dataset_train = CAGDATASET(
+            config=config,
+            mode="pretrain",
+            sampling_rate=config['sampling_rate'],
+            num_frames=config['loaders']['Crop_depth'],
+            train_jitter_scales=(256, 320),
+            repeat_aug=config['repeat_aug'],
+            jitter_aspect_relative=args.jitter_aspect_relative,
+            jitter_scales_relative=args.jitter_scales_relative,
+        )
+    else:
+        raise ValueError('Unknown distributed dataset backend: {}'.format(config['distributed_dataset_backend']))
     if args.distributed:
         num_tasks = misc.get_world_size()
         global_rank = misc.get_rank()
-        sampler_train = torch.utils.data.DistributedSampler(
-            dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
-        )
+        if config["distributed_dataset_backend"] == "monai":
+            sampler_train = DistributedSampler(
+                    dataset=dataset_train,
+                    even_divisible=True,
+                    shuffle=True)
+        elif config["distributed_dataset_backend"] == "pytorch":
+            sampler_train = torch.utils.data.DistributedSampler(
+                dataset_train, num_replicas=num_tasks, rank=global_rank, shuffle=True
+            )
+        else:
+            raise ValueError("Unknown distributed dataset backend: {}".format(config["distributed_dataset_backend"]))
         print("Sampler_train = %s" % str(sampler_train))
     else:
         num_tasks = 1
         global_rank = 0
         sampler_train = torch.utils.data.RandomSampler(dataset_train)
 
-    if global_rank == 0 and args.log_dir is not None:
+    if global_rank == 0 and config['log_dir'] is not None:
         try:
-            pathmgr.mkdirs(args.log_dir)
+            pathmgr.mkdirs(config['log_dir'])
         except Exception as _:
             pass
-        log_writer = SummaryWriter(log_dir=args.log_dir)
+        log_writer = SummaryWriter(log_dir=config['log_dir'])
     else:
         log_writer = None
-
-    data_loader_train = torch.utils.data.DataLoader(
-        dataset_train,
-        sampler=sampler_train,
-        batch_size=args.batch_size,
-        num_workers=args.num_workers,
-        pin_memory=args.pin_mem,
-        drop_last=True,
-    )
-
+    
+    # chr edit
+    if config["distributed_dataset_backend"] == "monai":
+        data_loader_train = ThreadDataLoader(
+                dataset_train,
+                sampler=sampler_train,
+                batch_size=config['loaders']['batchSize'],
+                shuffle=False,
+                num_workers=0, #config['num_workers'],
+                collate_fn=pad_list_data_collate,
+                pin_memory=False,) #True if config['cpu'] == "False" else False,)
+    elif config["distributed_dataset_backend"] == "pytorch":
+        
+        data_loader_train = torch.utils.data.DataLoader(
+            dataset_train,
+            sampler=sampler_train,
+            batch_size=config['loaders']['batchSize'],
+            num_workers=args.num_workers,
+            pin_memory=config['pin_mem'],
+            drop_last=True,
+        )
+    else:
+        raise ValueError("Unknown distributed dataset backend: %s" % config["distributed_dataset_backend"])
+    
     # define the model
-    model = models_mae.__dict__[args.model](
+    model = models_mae.__dict__[config['model_pretrain']](
         **vars(args),
     )
 
@@ -269,18 +250,18 @@ def main(args):
     model_without_ddp = model
     print("Model = %s" % str(model_without_ddp))
 
-    eff_batch_size = args.batch_size * args.accum_iter * misc.get_world_size()
+    eff_batch_size = config['loaders']['batchSize']* config['accum_iter']* misc.get_world_size()
 
     if args.lr is None:  # only base_lr is specified
-        args.lr = args.blr * eff_batch_size / 256
+        args.lr = config['blr'] * eff_batch_size / 256
 
     print("base lr: %.2e" % (args.lr * 256 / eff_batch_size))
     print("actual lr: %.2e" % args.lr)
 
-    print("accumulate grad iterations: %d" % args.accum_iter)
+    print("accumulate grad iterations: %d" % config['accum_iter'])
     print("effective batch size: %d" % eff_batch_size)
 
-    if args.distributed:
+    if config['distributed']:
         model = torch.nn.parallel.DistributedDataParallel(
             model,
             device_ids=[torch.cuda.current_device()],
@@ -313,9 +294,9 @@ def main(args):
     )
 
     checkpoint_path = ""
-    print(f"Start training for {args.epochs} epochs")
+    print(f"Start training for {config['epochs']} epochs")
     start_time = time.time()
-    for epoch in range(args.start_epoch, args.epochs):
+    for epoch in range(args.start_epoch, config['epochs']):
         if args.distributed:
             data_loader_train.sampler.set_epoch(epoch)
         train_stats = train_one_epoch(
@@ -328,18 +309,32 @@ def main(args):
             log_writer=log_writer,
             args=args,
             fp32=args.fp32,
+            config=config,
         )
         if args.output_dir and (
-            epoch % args.checkpoint_period == 0 or epoch + 1 == args.epochs
+            epoch % args.checkpoint_period == 0 or epoch + 1 == config['epochs']
         ):
-            checkpoint_path = misc.save_model(
-                args=args,
-                model=model,
-                model_without_ddp=model_without_ddp,
-                optimizer=optimizer,
-                loss_scaler=loss_scaler,
-                epoch=epoch,
-            )
+            if config['distributed_dataset_backend'] == "monai":
+                if epoch % config['frequence_save_checkpoint'] == 0:
+                    checkpoint_path = misc.save_model(
+                        args=args,
+                        model=model,
+                        model_without_ddp=model_without_ddp,
+                        optimizer=optimizer,
+                        loss_scaler=loss_scaler,
+                        epoch=epoch,
+                    )
+            elif config['distributed_dataset_backend'] == "pytorch":
+                checkpoint_path = misc.save_model(
+                        args=args,
+                        model=model,
+                        model_without_ddp=model_without_ddp,
+                        optimizer=optimizer,
+                        loss_scaler=loss_scaler,
+                        epoch=epoch,
+                    )
+            else:
+                raise ValueError("Unknown distributed dataset backend: %s" % config["distributed_dataset_backend"])
 
         log_stats = {
             **{f"train_{k}": v for k, v in train_stats.items()},

@@ -20,7 +20,6 @@ import mae_st.util.logging as logging
 import psutil
 import torch
 import torch.distributed as dist
-import torch.fb.rendezvous.zeus
 from iopath.common.file_io import g_pathmgr as pathmgr
 from mae_st.util.logging import master_print as print
 from torch import inf
@@ -149,7 +148,7 @@ class MetricLogger(object):
             log_msg.append("max mem: {memory:.0f}")
         log_msg = self.delimiter.join(log_msg)
         MB = 1024.0 * 1024.0
-        for obj in iterable:
+        for obj in iterable.dataset:
             data_time.update(time.time() - end)
             yield obj
             iter_time.update(time.time() - end)
@@ -180,7 +179,7 @@ class MetricLogger(object):
                             data=str(data_time),
                         )
                     )
-            i += 1
+            i += 15
             end = time.time()
         total_time = time.time() - start_time
         total_time_str = str(datetime.timedelta(seconds=int(total_time)))
@@ -241,6 +240,7 @@ def save_on_master(state, path):
 
 def init_distributed_mode(args):
     if args.no_env:
+       # args.gpu=0 #edit chr
         pass
     elif args.dist_on_itp:
         args.rank = int(os.environ["OMPI_COMM_WORLD_RANK"])

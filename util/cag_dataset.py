@@ -20,10 +20,23 @@ import pandas as pd
 import psycopg2.extras
 import numpy as np
 from tqdm import tqdm
-
+import pandas as pd
+import psycopg2
+import os
+from sklearn.model_selection import GroupShuffleSplit
+import torch
+from monai.transforms import (
+    LoadImaged,
+    EnsureChannelFirstD,
+    Compose,
+    ScaleIntensityd,
+    RepeatChanneld,
+    ConcatItemsd,
+    SpatialPadd,
+    EnsureTyped,)
 import yaml
 
-class Kinetics(torch.utils.data.Dataset):
+class CAGDATASET(torch.utils.data.Dataset):
     """
     Kinetics video loader. Construct the Kinetics video loader, then sample
     clips from the videos. For training and validation, a single clip is
@@ -38,7 +51,6 @@ class Kinetics(torch.utils.data.Dataset):
         self,
         config,
         mode,
-        path_to_data_dir,
         # decoding setting
         sampling_rate=4,
         num_frames=16,
@@ -113,7 +125,6 @@ class Kinetics(torch.utils.data.Dataset):
         self._repeat_aug = repeat_aug
         self._video_meta = {}
         self._num_retries = num_retries
-        self._path_to_data_dir = path_to_data_dir
 
         self._train_jitter_scales = train_jitter_scales
         self._train_crop_size = train_crop_size
@@ -306,18 +317,23 @@ class Kinetics(torch.utils.data.Dataset):
                 continue
 
             # Decode video. Meta info is used to perform selective decoding.
-            frames, fps, decode_all_video = decoder.decode(
-                video_container,
-                sampling_rate,
-                self._num_frames,
-                temporal_sample_index,
-                self._test_num_ensemble_views,
-                video_meta=self._video_meta[index],
-                target_fps=self._target_fps,
-                max_spatial_scale=min_scale,
-                use_offset=self._use_offset_sampling,
-                rigid_decode_all_video=self.mode in ["pretrain"],
-            )
+            data = self.__transforms__()(self.df[index])
+            frames = data['inputs']
+            frames = frames.permute(3, 1, 2, 0)
+            fps = 1/(data['FrameTime']/1000) # replace with depth
+            decode_all_video = True
+            # frames, fps, decode_all_video = decoder.decode(
+            #     video_container,
+            #     sampling_rate,
+            #     self._num_frames,
+            #     temporal_sample_index,
+            #     self._test_num_ensemble_views,
+            #     video_meta=self._video_meta[index],
+            #     target_fps=self._target_fps,
+            #     max_spatial_scale=min_scale,
+            #     use_offset=self._use_offset_sampling,
+            #     rigid_decode_all_video=self.mode in ["pretrain"],
+            # )
 
             # If decoding failed (wrong format, video is too short, and etc),
             # select another video.
@@ -510,3 +526,70 @@ class Kinetics(torch.utils.data.Dataset):
             (int): the number of videos in the dataset.
         """
         return len(self._path_to_videos)
+    def getDataFromDatabase(self, config):
+        connection = psycopg2.connect(
+            host=config['host'],
+            database=config['database'],
+            user=config['username'],
+            password=config['password'])
+        sql = config['query'].replace(
+            "?table_name", "\"" + config['table_name'] + "\"")
+        sql = sql.replace(
+            "?schema_name", "\"" + config['schema_name'] + "\"")
+        sql = sql.replace(
+            "??", "\"")
+        df = pd.read_sql_query(sql, connection)
+        if len(df) == 0:
+            print('The requested query does not have any data!')
+        connection.close()
+        return df
+
+    def set_data_path(self, features):
+        for feature in features:
+            self.df[feature] = self.df[feature].apply(
+                        lambda x: os.path.join(self.config['DataSetPath'], x))
+
+    def get_input_features(self, csv, features='DcmPathFlatten'):
+        if features == 'DcmPathFlatten':
+            features = [col for col in
+                        csv.columns.tolist() if col.startswith(features)]
+        else:
+            features = features
+        return features
+    
+    def _construct_loader(self):
+        """
+        Construct the video loader.
+        """
+
+        self.df = self.getDataFromDatabase(self.config)
+        self.features = self.get_input_features(self.df)
+        self.set_data_path(self.features)
+
+        self._path_to_videos = self.df["DcmPathFlatten"].tolist()
+        self._labels = self.df["labels"].tolist()
+        self._spatial_temporal_idx = [0] * len(self.df)
+        self.df = self.df.to_dict('records')
+       # self.groupEntriesPrPatient(self.df)
+        
+        print('Constructing cag dataset')
+        
+
+    def __transforms__(self):
+        self.transforms = [
+                LoadImaged(keys=self.features),
+                EnsureChannelFirstD(keys=self.features),
+                SpatialPadd(
+                    keys=self.features,
+                    spatial_size=[self.config['loaders']['Crop_height'],
+                                self.config['loaders']['Crop_width'],
+                                self.config['loaders']['Crop_depth']]),
+                RepeatChanneld(keys=self.features, repeats=3),
+                ScaleIntensityd(keys=self.features),
+                EnsureTyped(keys=self.features, data_type='tensor'),
+                ConcatItemsd(keys=self.features, name='inputs')                
+                ]
+
+        self.transforms = Compose(self.transforms, log_stats=True)
+        self.transforms.set_random_state(seed=0)
+        return self.transforms
